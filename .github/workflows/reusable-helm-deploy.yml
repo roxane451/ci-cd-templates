@@ -1,0 +1,114 @@
+name: Reusable — Helm deploy (mode push)
+
+# Déploiement direct : helm upgrade --install depuis la CI, avec --atomic
+# (rollback automatique si le déploiement échoue).
+#
+# Alternative au mode GitOps (reusable-gitops-promote.yml), qui est à
+# privilégier : ce mode exige un kubeconfig dans les secrets de la CI.
+# L'approbation manuelle se configure via les GitHub Environments.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "GitHub Environment (preprod, production...)"
+        required: true
+        type: string
+      chart-ref:
+        description: "Chart à déployer (ex: oci://ghcr.io/<owner>/fullstack-app)"
+        required: true
+        type: string
+      chart-version:
+        description: "Version du chart (vide = dernière)"
+        required: false
+        type: string
+        default: ""
+      release-name:
+        description: "Nom de la release Helm"
+        required: true
+        type: string
+      namespace:
+        description: "Namespace cible"
+        required: true
+        type: string
+      values-files:
+        description: "Fichiers values, un par ligne, dans l'ordre d'application"
+        required: true
+        type: string
+      image-tag:
+        description: "Tag des images backend et frontend"
+        required: true
+        type: string
+      timeout:
+        description: "Timeout Helm"
+        required: false
+        type: string
+        default: "5m"
+    secrets:
+      KUBECONFIG_B64:
+        description: "Kubeconfig du cluster cible, encodé en base64"
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  helm-deploy:
+    name: Helm deploy → ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: helm-deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer Helm
+        uses: azure/setup-helm@v4
+
+      - name: Kubeconfig
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.kube
+          echo "${KUBECONFIG_B64}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Login GHCR (chart OCI)
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: echo "${REGISTRY_TOKEN}" | helm registry login ghcr.io --username "${REGISTRY_USER}" --password-stdin
+
+      - name: helm upgrade --install
+        env:
+          CHART_REF: ${{ inputs.chart-ref }}
+          CHART_VERSION: ${{ inputs.chart-version }}
+          RELEASE: ${{ inputs.release-name }}
+          NAMESPACE: ${{ inputs.namespace }}
+          VALUES_FILES: ${{ inputs.values-files }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          TIMEOUT: ${{ inputs.timeout }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ -n "${CHART_VERSION}" ]; then
+            ARGS+=(--version "${CHART_VERSION}")
+          fi
+          while IFS= read -r file; do
+            [ -n "${file}" ] && ARGS+=(-f "${file}")
+          done <<< "${VALUES_FILES}"
+
+          helm upgrade --install "${RELEASE}" "${CHART_REF}" "${ARGS[@]}" \
+            --namespace "${NAMESPACE}" \
+            --create-namespace \
+            --set backend.image.tag="${IMAGE_TAG}" \
+            --set frontend.image.tag="${IMAGE_TAG}" \
+            --atomic \
+            --timeout "${TIMEOUT}"
+
+      - name: Nettoyer le kubeconfig
+        if: always()
+        run: rm -f ~/.kube/config
