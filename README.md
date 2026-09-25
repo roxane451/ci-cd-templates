@@ -1,268 +1,197 @@
-# ci-cd-helm
+# ci-cd-templates
 
-Bibliothèque de workflows GitHub Actions **réutilisables** pour applications MERN (React + Node.js + MongoDB) déployées sur Kubernetes via Helm.
- 
-Ces workflows sont conçus pour être appelés depuis n'importe quel repo applicatif via `workflow_call`, sans duplication de logique CI/CD.
- 
----
- 
-## Vue d'ensemble
- 
+[![CI](https://github.com/roxane451/ci-cd-templates/actions/workflows/ci.yml/badge.svg)](https://github.com/roxane451/ci-cd-templates/actions/workflows/ci.yml)
+![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-reusable%20workflows-2088FF?logo=githubactions&logoColor=white)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+
+Bibliothèque de templates CI/CD réutilisables pour des applications
+conteneurisées (backend Node.js + frontend, monorepo npm workspaces) déployées sur
+Kubernetes avec Helm, en GitOps ou en mode push.
+
+Chaque dépôt applicatif décrit son pipeline en quelques lignes ; la logique
+(scan, build, tests, déploiement) est maintenue à un seul endroit, et tout ce qui
+dépend du projet (dépôts, images, chemins, endpoints) est passé en paramètre.
+
+> Ces templates sont utilisés en production par un projet privé, qui leur passe
+> ses propres valeurs. Voir aussi le chart
+> [`helm-fullstack-chart`](https://github.com/roxane451/helm-fullstack-chart) et
+> l'infrastructure [`k3s-gitops-platform`](https://github.com/roxane451/k3s-gitops-platform).
+
+## Plateformes
+
+| Plateforme | Emplacement | Consommation |
+|---|---|---|
+| GitHub Actions | [`.github/workflows/`](.github/workflows/) | `uses: roxane451/ci-cd-templates/.github/workflows/<workflow>.yml@v1` |
+
+## Structure
+
+```text
+ci-cd-templates/
+├── .github/workflows/   # workflows réutilisables GitHub Actions + CI du dépôt
+├── examples/github/     # pipeline applicatif complet
+└── README.md
 ```
-feature/** / develop          main                  tag vX.Y.Z-rc       tag vX.Y.Z
-─────────────────────         ────────────────────  ─────────────────   ──────────────────
-secret-scan                   secret-scan           secret-scan         secret-scan
-lint-test                     lint-test             lint-test           lint-test
-                              build-backend         build-backend       build-backend
-                              build-frontend        build-frontend      build-frontend
-                              ayur-smoke (k3d)
-                                                    deploy → preprod    deploy → prod
-                                                                        (approbation requise)
+
+## Pipeline type
+
+```mermaid
+flowchart LR
+    A[push] --> S[secret-scan]
+    A --> L[lint-test]
+    S --> B[build-push<br/>backend + frontend]
+    L --> B
+    B -->|main| K[smoke-test-k3d]
+    B -->|tag vX.Y.Z-rc| P[gitops-promote<br/>préprod]
+    B -->|tag vX.Y.Z| R[gitops-promote<br/>production]
+    R -. approbation .-> R
+    P --> G[(dépôt GitOps)]
+    R --> G
+    G --> AR[ArgoCD sync]
 ```
- 
----
- 
-## Workflows disponibles
- 
-### `reusable-secret-scan.yml`
- 
-Scan de secrets dans l'historique Git complet avec [Gitleaks](https://github.com/gitleaks/gitleaks).
- 
-**Déclencheur :** `workflow_call` — aucun paramètre requis.
- 
-**Utilisation :**
+
+| Déclencheur | Jobs |
+|---|---|
+| `feature/**`, `develop`, PR | secret-scan, lint-test |
+| `main` | + build, scan & push des images, smoke test k3d |
+| tag `vX.Y.Z-rc` | + promotion GitOps en préprod |
+| tag `vX.Y.Z` | + promotion GitOps en production, après approbation |
+
+Pipeline complet prêt à copier : [`examples/github/app-ci-cd.yml`](examples/github/app-ci-cd.yml).
+
+## GitHub Actions
+
+| Workflow | Rôle |
+|---|---|
+| [`reusable-secret-scan.yml`](.github/workflows/reusable-secret-scan.yml) | Gitleaks sur tout l'historique Git |
+| [`reusable-lint-test.yml`](.github/workflows/reusable-lint-test.yml) | Lint, tests et `npm audit` par workspace |
+| [`reusable-build-push.yml`](.github/workflows/reusable-build-push.yml) | Build Docker, scan Trivy bloquant, push GHCR |
+| [`reusable-smoke-test-k3d.yml`](.github/workflows/reusable-smoke-test-k3d.yml) | Déploiement du chart dans un k3d éphémère + test HTTP |
+| [`reusable-gitops-promote.yml`](.github/workflows/reusable-gitops-promote.yml) | Mise à jour du tag d'image dans le dépôt GitOps (ArgoCD) |
+| [`reusable-helm-deploy.yml`](.github/workflows/reusable-helm-deploy.yml) | `helm upgrade --install --atomic` direct (mode push) |
+| [`reusable-update-helm-dep.yml`](.github/workflows/reusable-update-helm-dep.yml) | Montée de version d'une dépendance Helm + `Chart.lock` |
+
+### secret-scan
+
+| Input | Défaut | Description |
+|---|---|---|
+| `gitleaks-version` | `8.24.0` | Version de Gitleaks |
+| `config-path` | `.gitleaks.toml` | Configuration, utilisée si le fichier existe |
+
+Utilise le binaire Gitleaks plutôt que `gitleaks-action`, qui exige une licence
+pour les dépôts d'organisation.
+
+### lint-test
+
+| Input | Défaut | Description |
+|---|---|---|
+| `node-version` | `22` | Version de Node.js |
+| `workspaces` | `backend frontend` | Workspaces npm, séparés par des espaces |
+| `audit-level` | `high` | Seuil `npm audit` bloquant (dépendances de production) |
+
+`npm ci` à la racine (npm workspaces). Les scripts `lint` / `test` absents d'un
+workspace sont ignorés.
+
+### build-push
+
+| Input | Défaut | Description |
+|---|---|---|
+| `image-name` | — | Image produite : `ghcr.io/<owner>/<image-name>` |
+| `dockerfile` | — | Chemin du Dockerfile |
+| `build-context` | `.` | Contexte Docker (racine du monorepo) |
+| `trivy-severity` | `CRITICAL,HIGH` | Sévérités bloquantes |
+| `upload-sarif` | `true` | Rapport Trivy dans l'onglet Security |
+
+Outputs : `image-tag` (`vX.Y.Z` sur tag Git, `sha-<short>` sinon) et `digest`.
+
+L'image est construite localement, **scannée, puis poussée seulement si le scan
+passe** : une CVE critique ou haute corrigeable bloque le pipeline. Le push
+réutilise le cache BuildKit du build scanné.
+
+### smoke-test-k3d
+
+| Input | Défaut | Description |
+|---|---|---|
+| `chart-ref` | — | Chart, ex. `oci://ghcr.io/roxane451/fullstack-app` |
+| `chart-version` | dernière | Version du chart |
+| `image-tag` | — | Tag des images backend et frontend |
+| `values-repository` | dépôt appelant | Dépôt contenant le fichier values |
+| `values-file` | — | Fichier values k3d |
+| `extra-values` | — | Values YAML en ligne, appliquées après `values-file` (valeurs de test) |
+| `namespace` | `smoke` | Namespace de test |
+| `staged-deploy` | `false` | Déploie d'abord la base seule, puis l'application |
+| `health-service` / `health-port` / `health-path` | `backend` / `5000` / `/api/health` | Endpoint sondé |
+| `k3d-version` | `v5.7.4` | Version de k3d |
+
+Secret optionnel `repo-token` (dépôt de values ou images privés), `GITHUB_TOKEN`
+sinon. Le cluster, nommé d'après le run, est toujours supprimé en fin de job.
+
+### gitops-promote
+
+| Input | Défaut | Description |
+|---|---|---|
+| `environment` | — | GitHub Environment (approbation, historique des déploiements) |
+| `image-tag` | — | Tag à déployer |
+| `gitops-repository` | — | Dépôt GitOps (`owner/name`) |
+| `values-file` | — | Fichier values à modifier |
+| `image-keys` | `backend frontend` | Chemins mis à jour (`<chemin>.image.tag`), ex. `mon-chart.backend` pour un chart wrapper |
+
+Secret requis : `gitops-token` (écriture sur le dépôt GitOps).
+
+La modification passe par `yq` et non `sed` : seule la clé visée change, quel que
+soit l'ordre des champs, et les commentaires sont préservés. Un chemin absent
+fait échouer le job plutôt que de créer une clé inutile. Les promotions vers
+un même dépôt sont sérialisées et le push est rejoué après rebase en cas de conflit.
+
+### helm-deploy
+
+Inputs : `environment`, `chart-ref`, `chart-version`, `release-name`, `namespace`,
+`values-files` (un par ligne), `image-tag`, `timeout` (`5m`).
+Secret requis : `KUBECONFIG_B64` (`base64 -w 0 ~/.kube/config`).
+
+Mode push, conservé comme alternative : il impose de confier un kubeconfig à la
+CI, là où le mode GitOps ne donne à la CI qu'un droit d'écriture sur un dépôt Git.
+
+### update-helm-dep
+
+Inputs : `dependency-name`, `dependency-version`, `chart-path` (`helm`),
+`helm-repos` (dépôts classiques à ajouter, inutile pour l'OCI).
+
+Met à jour `Chart.yaml` avec `yq`, régénère `Chart.lock`, lance `helm lint` puis
+committe. Se déclenche typiquement sur un `repository_dispatch` émis à la
+publication du chart dépendance.
+
+## Permissions et secrets
+
+Les workflows déclarent le minimum nécessaire ; le job appelant doit accorder au
+moins ces permissions (voir l'exemple).
+
+| Workflow | Permissions | Secrets |
+|---|---|---|
+| secret-scan, lint-test | `contents: read` | — |
+| build-push | `contents: read`, `packages: write`, `security-events: write` | — (`GITHUB_TOKEN`) |
+| smoke-test-k3d | `contents: read`, `packages: read` | `repo-token` (optionnel) |
+| gitops-promote | `contents: read` | `gitops-token` |
+| helm-deploy | `contents: read`, `packages: read` | `KUBECONFIG_B64` |
+| update-helm-dep | `contents: write`, `packages: read` | — |
+
+## Versionnement
+
+Référencer une version plutôt que `main` :
+
 ```yaml
-jobs:
-  secret-scan:
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-secret-scan.yml@main
-    secrets: inherit
+uses: roxane451/ci-cd-templates/.github/workflows/reusable-build-push.yml@v1
 ```
- 
----
- 
-### `reusable-lint-test.yml`
- 
-TypeScript check, ESLint, tests Jest (backend + frontend) et `npm audit` sur les deux workspaces.
- 
-**Déclencheur :** `workflow_call` — aucun paramètre requis.
- 
-**Node.js :** version 22 LTS (alignée avec les images Docker de production).
- 
-**Utilisation :**
-```yaml
-jobs:
-  lint-test:
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-lint-test.yml@main
-    secrets: inherit
-```
- 
-> Le workflow installe les dépendances depuis la racine (`npm ci`) pour supporter les npm workspaces. Le `package-lock.json` doit être à la racine du repo applicatif.
- 
----
- 
-### `reusable-build-push.yml`
- 
-Build Docker multi-stage, scan CVE Trivy et push vers GHCR.
- 
-**Déclencheur :** `workflow_call`
- 
-| Paramètre | Type | Description |
-|-----------|------|-------------|
-| `image-name` | `string` | Nom de l'image — ex: `backend`, `frontend` |
-| `context` | `string` | Contexte Docker — ex: `./backend`, `./frontend` |
- 
-**Output :**
- 
-| Nom | Description |
-|-----|-------------|
-| `image-tag` | Tag principal poussé (`sha-<short>` sur branche, `vX.Y.Z` sur tag git) |
- 
-**Image produite :** `ghcr.io/<owner>/<image-name>:<tag>`
- 
-**Comportement :**
-- Sur push de **branche** → tag `sha-<short>`
-- Sur push de **tag git** → tag sémantique (`v1.2.3` ou `v1.2.3-rc`)
-- Trivy bloque le build si une CVE `CRITICAL` ou `HIGH` avec un fix disponible est détectée
-- Le résultat Trivy est uploadé en SARIF dans l'onglet Security du repo
-- Trivy scanne le digest exact de l'image buildée localement (via `iidfile`) — pas un tag registry potentiellement stale
-- Le cache BuildKit est partagé entre les runs via GitHub Actions cache
-**Utilisation :**
-```yaml
-jobs:
-  build-backend:
-    needs: [secret-scan, lint-test]
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-build-push.yml@main
-    with:
-      image-name: backend
-      context: ./backend
-    secrets: inherit
- 
-  build-frontend:
-    needs: [secret-scan, lint-test]
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-build-push.yml@main
-    with:
-      image-name: frontend
-      context: ./frontend
-    secrets: inherit
-```
- 
----
- 
-### `reusable-ayur-smoke-k3d.yml`
- 
-Déploiement dans un cluster k3d éphémère sur runner **self-hosted**, smoke test HTTP sur `/api/health`, puis suppression du cluster.
- 
-**Déclencheur :** `workflow_call`
- 
-| Paramètre | Type | Description |
-|-----------|------|-------------|
-| `image-tag` | `string` | Tag des images à déployer |
- 
-**Prérequis runner self-hosted :** `k3d`, `kubectl`, `helm` installés.
- 
-**Utilisation :**
-```yaml
-jobs:
-  ayur-smoke:
-    needs: [build-backend, build-frontend]
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-ayur-smoke-k3d.yml@main
-    with:
-      image-tag: ${{ needs.build-backend.outputs.image-tag }}
-    secrets: inherit
-```
- 
----
- 
-### `reusable-helm-deploy.yml`
- 
-Déploiement Helm sur cluster K3s via `helm upgrade --install` avec `--atomic` (rollback automatique en cas d'échec).
- 
-**Déclencheur :** `workflow_call`
- 
-| Paramètre | Type | Description |
-|-----------|------|-------------|
-| `environment` | `string` | `preprod` ou `prod` |
-| `image-tag` | `string` | Tag des images à déployer |
-| `helm-values-file` | `string` | Chemin du fichier values dans `ayur-veda-helm` — ex: `helm/values-preprod.yaml` |
- 
-| Secret | Description |
-|--------|-------------|
-| `KUBECONFIG_B64` | Kubeconfig encodé en base64 |
- 
-Le workflow checkout automatiquement le repo `ayur-veda-helm` pour récupérer les values files.
- 
-**Utilisation :**
-```yaml
-jobs:
-  deploy-preprod:
-    needs: [build-backend, build-frontend]
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-helm-deploy.yml@main
-    with:
-      environment: preprod
-      image-tag: ${{ github.ref_name }}
-      helm-values-file: helm/values-preprod.yaml
-    secrets: inherit
- 
-  deploy-prod:
-    needs: [build-backend, build-frontend]
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-helm-deploy.yml@main
-    with:
-      environment: prod
-      image-tag: ${{ github.ref_name }}
-      helm-values-file: helm/values-production.yaml
-    secrets: inherit
-```
- 
-> L'approbation manuelle en production est configurée via **GitHub Environments** — le job attend une validation humaine avant d'exécuter le déploiement.
- 
----
- 
-## Intégration dans un repo applicatif
- 
-Exemple de workflow complet (`ci-cd.yml`) reproduisant la stratégie de branchement ci-dessus :
- 
-```yaml
-name: CI/CD
- 
-on:
-  push:
-    branches:
-      - "feature/**"
-      - develop
-      - main
-    tags:
-      - "v[0-9]+.[0-9]+.[0-9]+-rc"
-      - "v[0-9]+.[0-9]+.[0-9]+"
- 
-jobs:
-  secret-scan:
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-secret-scan.yml@main
-    secrets: inherit
- 
-  lint-test:
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-lint-test.yml@main
-    secrets: inherit
- 
-  build-backend:
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-    needs: [secret-scan, lint-test]
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-build-push.yml@main
-    with:
-      image-name: backend
-      context: ./backend
-    secrets: inherit
- 
-  build-frontend:
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
-    needs: [secret-scan, lint-test]
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-build-push.yml@main
-    with:
-      image-name: frontend
-      context: ./frontend
-    secrets: inherit
- 
-  ayur-smoke:
-    if: github.ref == 'refs/heads/main'
-    needs: [build-backend, build-frontend]
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-ayur-smoke-k3d.yml@main
-    with:
-      image-tag: ${{ needs.build-backend.outputs.image-tag }}
-    secrets: inherit
- 
-  deploy-preprod:
-    if: startsWith(github.ref, 'refs/tags/') && contains(github.ref, '-rc')
-    needs: [build-backend, build-frontend]
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-helm-deploy.yml@main
-    with:
-      environment: preprod
-      image-tag: ${{ github.ref_name }}
-      helm-values-file: helm/values-preprod.yaml
-    secrets: inherit
- 
-  deploy-prod:
-    if: startsWith(github.ref, 'refs/tags/') && !contains(github.ref, '-rc')
-    needs: [build-backend, build-frontend]
-    uses: roxane451/ci-cd-helm/.github/workflows/reusable-helm-deploy.yml@main
-    with:
-      environment: prod
-      image-tag: ${{ github.ref_name }}
-      helm-values-file: helm/values-production.yaml
-    secrets: inherit
-```
- 
----
- 
-## Secrets requis
- 
-Les secrets sont transmis via `secrets: inherit`. Ils doivent être configurés dans le repo applicatif ou au niveau de l'organisation.
- 
-| Secret | Utilisé par | Description |
-|--------|-------------|-------------|
-| `PAT_HELM_REPO` | tous | Automatiquement disponible — push GHCR, upload SARIF |
-| `KUBECONFIG_B64` | `reusable-helm-deploy` | Kubeconfig du cluster cible encodé en base64 |
- 
-Pour générer `KUBECONFIG_B64` :
-```bash
-cat ~/.kube/config | base64 -w 0
-```
- 
+
+Les tags `vX.Y.Z` sont immuables ; le tag `v1` suit la dernière version compatible.
+Les actions tierces sont épinglées et tenues à jour par Dependabot.
+
+## Qualité
+
+La CI du dépôt passe tous les workflows et les exemples dans
+[actionlint](https://github.com/rhysd/actionlint), qui vérifie la syntaxe, les
+expressions, les inputs des workflows réutilisables et les scripts shell
+(via shellcheck).
+
+## Licence
+
+[MIT](LICENSE)
