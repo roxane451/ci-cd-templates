@@ -1,0 +1,131 @@
+name: Reusable — Build, scan & push (GHCR)
+
+# 1. Build de l'image en local
+# 2. Scan Trivy de CETTE image : le job échoue sur une CVE CRITICAL/HIGH corrigeable
+# 3. Push sur GHCR uniquement si le scan est passé
+#
+# Tags produits : sha-<short> sur une branche, vX.Y.Z (et sha-<short>) sur un tag Git.
+#
+# Permissions requises côté appelant : contents: read, packages: write,
+# security-events: write (si upload-sarif = true).
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Nom de l'image (ghcr.io/<owner>/<image-name>)"
+        required: true
+        type: string
+      dockerfile:
+        description: "Chemin du Dockerfile (ex: backend/Dockerfile)"
+        required: true
+        type: string
+      build-context:
+        description: "Contexte Docker (racine du monorepo par défaut)"
+        required: false
+        type: string
+        default: "."
+      trivy-severity:
+        description: "Sévérités bloquantes"
+        required: false
+        type: string
+        default: "CRITICAL,HIGH"
+      upload-sarif:
+        description: "Publier le rapport Trivy dans l'onglet Security"
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      image-tag:
+        description: "Tag principal poussé (vX.Y.Z sur tag Git, sha-<short> sinon)"
+        value: ${{ jobs.build-push.outputs.image-tag }}
+      digest:
+        description: "Digest de l'image poussée"
+        value: ${{ jobs.build-push.outputs.digest }}
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+jobs:
+  build-push:
+    name: Build, Trivy & push
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      digest: ${{ steps.push.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}
+          tags: |
+            type=ref,event=tag
+            type=sha,prefix=sha-,format=short
+
+      - name: Build (local, pour le scan)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build-context }}
+          file: ${{ inputs.dockerfile }}
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ inputs.image-name }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image-name }}
+
+      - name: Trivy — scan bloquant
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:${{ steps.meta.outputs.version }}
+          format: table
+          severity: ${{ inputs.trivy-severity }}
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Trivy — rapport SARIF
+        if: always() && inputs.upload-sarif
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:${{ steps.meta.outputs.version }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: ${{ inputs.trivy-severity }}
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - name: Upload SARIF
+        if: always() && inputs.upload-sarif && hashFiles('trivy-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-${{ inputs.image-name }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Même contexte et même cache que le build local : les couches sont
+      # réutilisées, l'image poussée est celle qui a été scannée.
+      - name: Push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build-context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ inputs.image-name }}
