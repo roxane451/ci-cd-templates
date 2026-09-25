@@ -1,0 +1,204 @@
+name: Reusable — Smoke test (k3d éphémère)
+
+# Déploie le chart dans un cluster k3d créé pour l'occasion sur le runner,
+# vérifie que les Deployments sont disponibles et qu'un endpoint de santé
+# répond, puis supprime le cluster.
+
+on:
+  workflow_call:
+    inputs:
+      chart-ref:
+        description: "Chart à déployer (ex: oci://ghcr.io/<owner>/fullstack-app)"
+        required: true
+        type: string
+      chart-version:
+        description: "Version du chart (vide = dernière)"
+        required: false
+        type: string
+        default: ""
+      image-tag:
+        description: "Tag des images backend et frontend"
+        required: true
+        type: string
+      values-repository:
+        description: "Dépôt contenant le fichier values (owner/name, vide = dépôt appelant)"
+        required: false
+        type: string
+        default: ""
+      values-file:
+        description: "Fichier values k3d, relatif au dépôt de values"
+        required: true
+        type: string
+      extra-values:
+        description: "Values YAML supplémentaires, en ligne, appliquées après values-file (valeurs de test uniquement)"
+        required: false
+        type: string
+        default: ""
+      namespace:
+        description: "Namespace de test"
+        required: false
+        type: string
+        default: "smoke"
+      staged-deploy:
+        description: "Déployer d'abord la base seule (backend/frontend désactivés), puis l'application"
+        required: false
+        type: boolean
+        default: false
+      health-service:
+        description: "Service Kubernetes à sonder"
+        required: false
+        type: string
+        default: "backend"
+      health-port:
+        description: "Port du service"
+        required: false
+        type: number
+        default: 5000
+      health-path:
+        description: "Chemin HTTP de l'endpoint de santé"
+        required: false
+        type: string
+        default: "/api/health"
+      k3d-version:
+        description: "Version de k3d"
+        required: false
+        type: string
+        default: "v5.7.4"
+    secrets:
+      repo-token:
+        description: "Token lecture (dépôt de values privé, images GHCR privées). Défaut : GITHUB_TOKEN"
+        required: false
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  NAMESPACE: ${{ inputs.namespace }}
+  RELEASE: smoke
+  CLUSTER: smoke-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  smoke-test:
+    name: Smoke test k3d
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout values
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.values-repository || github.repository }}
+          token: ${{ secrets.repo-token || secrets.GITHUB_TOKEN }}
+          path: values
+
+      - name: Installer k3d
+        env:
+          K3D_VERSION: ${{ inputs.k3d-version }}
+        run: curl -sSfL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
+
+      - name: Installer Helm
+        uses: azure/setup-helm@v4
+
+      - name: Créer le cluster
+        run: k3d cluster create "${CLUSTER}" --wait --timeout 120s
+
+      - name: Accès GHCR (chart OCI et images)
+        env:
+          REGISTRY_TOKEN: ${{ secrets.repo-token || secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          echo "${REGISTRY_TOKEN}" | helm registry login ghcr.io --username "${REGISTRY_USER}" --password-stdin
+          # Namespace pré-créé pour y placer le secret de pull, et marqué
+          # comme appartenant à la release pour qu'un chart qui déclare
+          # lui-même son Namespace puisse l'adopter.
+          kubectl create namespace "${NAMESPACE}"
+          kubectl label namespace "${NAMESPACE}" app.kubernetes.io/managed-by=Helm
+          kubectl annotate namespace "${NAMESPACE}" \
+            meta.helm.sh/release-name="${RELEASE}" \
+            meta.helm.sh/release-namespace="${NAMESPACE}"
+          kubectl create secret docker-registry ghcr-secret \
+            --docker-server=ghcr.io \
+            --docker-username="${REGISTRY_USER}" \
+            --docker-password="${REGISTRY_TOKEN}" \
+            --namespace="${NAMESPACE}"
+
+      - name: Déployer le chart
+        env:
+          CHART_REF: ${{ inputs.chart-ref }}
+          CHART_VERSION: ${{ inputs.chart-version }}
+          VALUES_FILE: values/${{ inputs.values-file }}
+          EXTRA_VALUES: ${{ inputs.extra-values }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          STAGED: ${{ inputs.staged-deploy }}
+        run: |
+          set -euo pipefail
+          ARGS=(-f "${VALUES_FILE}")
+          if [ -n "${EXTRA_VALUES}" ]; then
+            printf '%s\n' "${EXTRA_VALUES}" > /tmp/extra-values.yaml
+            ARGS+=(-f /tmp/extra-values.yaml)
+          fi
+          if [ -n "${CHART_VERSION}" ]; then
+            ARGS+=(--version "${CHART_VERSION}")
+          fi
+
+          ENABLE_ARGS=()
+          if [ "${STAGED}" = "true" ]; then
+            ENABLE_ARGS=(--set backend.enabled=true --set frontend.enabled=true)
+            echo "::group::Phase 1 — base de données seule"
+            helm upgrade --install "${RELEASE}" "${CHART_REF}" "${ARGS[@]}" \
+              --namespace "${NAMESPACE}" \
+              --set backend.enabled=false \
+              --set frontend.enabled=false \
+              --wait --timeout 300s
+            echo "::endgroup::"
+          fi
+
+          echo "::group::Déploiement complet"
+          helm upgrade --install "${RELEASE}" "${CHART_REF}" "${ARGS[@]}" "${ENABLE_ARGS[@]}" \
+            --namespace "${NAMESPACE}" \
+            --set backend.image.tag="${IMAGE_TAG}" \
+            --set frontend.image.tag="${IMAGE_TAG}" \
+            --wait --timeout 600s
+          echo "::endgroup::"
+
+      - name: Vérifier les Deployments
+        run: kubectl wait deployment --all --for=condition=Available --namespace "${NAMESPACE}" --timeout=180s
+
+      - name: Smoke test HTTP
+        env:
+          SERVICE: ${{ inputs.health-service }}
+          PORT: ${{ inputs.health-port }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+        run: |
+          set -euo pipefail
+          kubectl port-forward "svc/${SERVICE}" 18080:"${PORT}" --namespace "${NAMESPACE}" >/tmp/port-forward.log 2>&1 &
+          PF_PID=$!
+          trap 'kill "${PF_PID}" 2>/dev/null || true' EXIT
+
+          for attempt in $(seq 1 15); do
+            if curl -fsS "http://127.0.0.1:18080${HEALTH_PATH}"; then
+              echo
+              echo "Endpoint de santé OK (tentative ${attempt})"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::${HEALTH_PATH} ne répond pas"
+          cat /tmp/port-forward.log
+          exit 1
+
+      - name: Diagnostic
+        if: failure()
+        run: |
+          kubectl get all --namespace "${NAMESPACE}" || true
+          kubectl describe pods --namespace "${NAMESPACE}" || true
+          kubectl get events --namespace "${NAMESPACE}" --sort-by=.lastTimestamp || true
+          for deploy in $(kubectl get deploy -o name --namespace "${NAMESPACE}" 2>/dev/null); do
+            echo "::group::logs ${deploy}"
+            kubectl logs "${deploy}" --namespace "${NAMESPACE}" --tail=50 --all-containers || true
+            echo "::endgroup::"
+          done
+
+      - name: Supprimer le cluster
+        if: always()
+        run: k3d cluster delete "${CLUSTER}" || true
