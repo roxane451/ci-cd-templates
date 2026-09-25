@@ -1,0 +1,87 @@
+# Exemple de pipeline d'un dépôt applicatif (monorepo backend + frontend)
+# utilisant les workflows réutilisables. À placer dans
+# .github/workflows/ci-cd.yml du dépôt applicatif.
+#
+#   feature/**, develop  → secret scan + lint/tests
+#   main                 → + build/scan/push des images + smoke test k3d
+#   tag vX.Y.Z-rc        → + promotion GitOps en préprod
+#   tag vX.Y.Z           → + promotion GitOps en production (approbation requise)
+
+name: CI/CD
+
+on:
+  push:
+    branches: ["feature/**", develop, main]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+-rc*", "v[0-9]+.[0-9]+.[0-9]+"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  secret-scan:
+    uses: roxane451/ci-cd-templates/.github/workflows/reusable-secret-scan.yml@v1
+
+  lint-test:
+    uses: roxane451/ci-cd-templates/.github/workflows/reusable-lint-test.yml@v1
+
+  build-backend:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    needs: [secret-scan, lint-test]
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    uses: roxane451/ci-cd-templates/.github/workflows/reusable-build-push.yml@v1
+    with:
+      image-name: my-app-backend
+      dockerfile: backend/Dockerfile
+
+  build-frontend:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    needs: [secret-scan, lint-test]
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    uses: roxane451/ci-cd-templates/.github/workflows/reusable-build-push.yml@v1
+    with:
+      image-name: my-app-frontend
+      dockerfile: frontend/Dockerfile
+
+  smoke-test:
+    if: github.ref == 'refs/heads/main'
+    needs: [build-backend, build-frontend]
+    permissions:
+      contents: read
+      packages: read
+    uses: roxane451/ci-cd-templates/.github/workflows/reusable-smoke-test-k3d.yml@v1
+    with:
+      chart-ref: oci://ghcr.io/roxane451/fullstack-app
+      chart-version: "1.0.0"
+      image-tag: ${{ needs.build-backend.outputs.image-tag }}
+      values-file: helm/values-k3d.yaml
+
+  promote-preprod:
+    if: startsWith(github.ref, 'refs/tags/') && contains(github.ref, '-rc')
+    needs: [build-backend, build-frontend]
+    uses: roxane451/ci-cd-templates/.github/workflows/reusable-gitops-promote.yml@v1
+    with:
+      environment: preprod
+      image-tag: ${{ needs.build-backend.outputs.image-tag }}
+      gitops-repository: roxane451/my-app-gitops
+      values-file: helm/values-preprod.yaml
+    secrets:
+      gitops-token: ${{ secrets.GITOPS_TOKEN }}
+
+  promote-production:
+    if: startsWith(github.ref, 'refs/tags/') && !contains(github.ref, '-rc')
+    needs: [build-backend, build-frontend]
+    uses: roxane451/ci-cd-templates/.github/workflows/reusable-gitops-promote.yml@v1
+    with:
+      environment: production   # GitHub Environment avec reviewers obligatoires
+      image-tag: ${{ needs.build-backend.outputs.image-tag }}
+      gitops-repository: roxane451/my-app-gitops
+      values-file: helm/values-production.yaml
+    secrets:
+      gitops-token: ${{ secrets.GITOPS_TOKEN }}
