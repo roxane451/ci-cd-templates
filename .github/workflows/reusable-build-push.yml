@@ -7,7 +7,9 @@ name: Reusable — Build, scan & push (GHCR)
 # Tags produits : sha-<short> sur une branche, vX.Y.Z (et sha-<short>) sur un tag Git.
 #
 # Permissions requises côté appelant : contents: read, packages: write,
-# security-events: write (si upload-sarif = true).
+# security-events: write et actions: read (si upload-sarif = true).
+# Sur un dépôt privé, l'upload SARIF exige GitHub Code Security : sans
+# licence, passer upload-sarif: false.
 
 on:
   workflow_call:
@@ -44,6 +46,7 @@ on:
         value: ${{ jobs.build-push.outputs.digest }}
 
 permissions:
+  actions: read
   contents: read
   packages: write
   security-events: write
@@ -57,14 +60,14 @@ jobs:
       digest: ${{ steps.push.outputs.digest }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}
           tags: |
@@ -72,10 +75,11 @@ jobs:
             type=sha,prefix=sha-,format=short
 
       - name: Build (local, pour le scan)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ inputs.build-context }}
           file: ${{ inputs.dockerfile }}
+          pull: true        # toujours partir de la dernière version de l'image de base
           load: true
           push: false
           tags: ${{ steps.meta.outputs.tags }}
@@ -103,15 +107,18 @@ jobs:
           ignore-unfixed: true
           exit-code: "0"
 
+      # Non bloquant : l'onglet Security est un confort, le scan bloquant
+      # ci-dessus reste le garde-fou.
       - name: Upload SARIF
         if: always() && inputs.upload-sarif && hashFiles('trivy-results.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
           category: trivy-${{ inputs.image-name }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -121,7 +128,7 @@ jobs:
       # réutilisées, l'image poussée est celle qui a été scannée.
       - name: Push
         id: push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ inputs.build-context }}
           file: ${{ inputs.dockerfile }}
