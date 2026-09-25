@@ -75,6 +75,7 @@ jobs:
             type=sha,prefix=sha-,format=short
 
       - name: Build (local, pour le scan)
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: ${{ inputs.build-context }}
@@ -96,8 +97,10 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
+      # Produit le rapport même si le scan bloquant a échoué, mais seulement
+      # si l'image a bien été construite (sinon il n'y a rien à scanner).
       - name: Trivy — rapport SARIF
-        if: always() && inputs.upload-sarif
+        if: always() && inputs.upload-sarif && steps.build.outcome == 'success'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:${{ steps.meta.outputs.version }}
@@ -110,7 +113,7 @@ jobs:
       # Non bloquant : l'onglet Security est un confort, le scan bloquant
       # ci-dessus reste le garde-fou.
       - name: Upload SARIF
-        if: always() && inputs.upload-sarif && hashFiles('trivy-results.sarif') != ''
+        if: always() && inputs.upload-sarif && steps.build.outcome == 'success' && hashFiles('trivy-results.sarif') != ''
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@v4
         with:
