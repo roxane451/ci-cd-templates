@@ -1,0 +1,127 @@
+name: Reusable — GitOps promote (mise à jour du tag d'image)
+
+# Déploiement GitOps : au lieu d'agir sur le cluster, le workflow met à jour
+# le tag d'image dans le fichier values du dépôt de configuration.
+# ArgoCD (ou Flux) détecte le commit et synchronise l'environnement.
+#
+#   build image (sha-xxxx) → commit du tag dans le dépôt GitOps → sync ArgoCD
+#
+# Aucun accès au cluster depuis la CI : pas de kubeconfig dans les secrets.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environnement cible (preprod, production...)"
+        required: true
+        type: string
+      image-tag:
+        description: "Tag à déployer (ex: sha-05644b3, v1.4.0)"
+        required: true
+        type: string
+      gitops-repository:
+        description: "Dépôt GitOps (owner/name)"
+        required: true
+        type: string
+      values-file:
+        description: "Fichier values à mettre à jour, relatif au dépôt GitOps"
+        required: true
+        type: string
+      image-keys:
+        description: "Chemins YAML des composants, séparés par des espaces : <chemin>.image.tag est mis à jour (ex: backend, ou mon-chart.backend pour un chart wrapper)"
+        required: false
+        type: string
+        default: "backend frontend"
+    secrets:
+      gitops-token:
+        description: "Token avec droit d'écriture sur le dépôt GitOps"
+        required: true
+
+permissions:
+  contents: read
+
+# Sérialise les promotions vers un même dépôt GitOps (évite les push concurrents)
+concurrency:
+  group: gitops-promote-${{ inputs.gitops-repository }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.image-tag }} → ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout du dépôt GitOps
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.gitops-repository }}
+          token: ${{ secrets.gitops-token }}
+          path: gitops
+
+      # yq (mikefarah) est préinstallé sur les runners ubuntu-latest.
+      # Contrairement à sed, il modifie la clé YAML visée quel que soit
+      # l'ordre des champs, et préserve les commentaires.
+      - name: Mettre à jour les tags
+        working-directory: gitops
+        env:
+          VALUES_FILE: ${{ inputs.values-file }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          IMAGE_KEYS: ${{ inputs.image-keys }}
+        run: |
+          set -euo pipefail
+          [ -f "${VALUES_FILE}" ] || { echo "::error::Fichier introuvable : ${VALUES_FILE}"; exit 1; }
+
+          # "mon-chart.backend" -> .["mon-chart"]["backend"] (gère les tirets)
+          to_path() {
+            local out="" part
+            IFS='.' read -ra parts <<< "$1"
+            for part in "${parts[@]}"; do out+="[\"${part}\"]"; done
+            echo ".${out}"
+          }
+
+          for key in ${IMAGE_KEYS}; do
+            [[ "${key}" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "::error::Clé invalide : ${key}"; exit 1; }
+            path="$(to_path "${key}").image.tag"
+
+            # Refuse de créer une clé absente : une faute de frappe ne doit pas
+            # produire un commit qui ne déploie rien.
+            if [ "$(yq "${path}" "${VALUES_FILE}")" = "null" ]; then
+              echo "::error::${key}.image.tag absent de ${VALUES_FILE}"
+              exit 1
+            fi
+
+            yq -i "${path} = strenv(IMAGE_TAG)" "${VALUES_FILE}"
+            echo "${key}.image.tag → $(yq "${path}" "${VALUES_FILE}")"
+          done
+
+      - name: Commit & push
+        working-directory: gitops
+        env:
+          VALUES_FILE: ${{ inputs.values-file }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+          TARGET_ENV: ${{ inputs.environment }}
+          SOURCE: ${{ github.repository }}@${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "${VALUES_FILE}"
+          if git diff --staged --quiet; then
+            echo "Tag déjà à jour, rien à committer."
+            exit 0
+          fi
+
+          git commit -m "ci(${TARGET_ENV}): deploy ${IMAGE_TAG}" -m "Source: ${SOURCE}"
+
+          # Rebase et nouvelle tentative si le dépôt a bougé entre-temps
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Poussé : ${TARGET_ENV} passera en ${IMAGE_TAG} au prochain sync"
+              exit 0
+            fi
+            echo "Push refusé (tentative ${attempt}/3), rebase..."
+            git pull --rebase
+          done
+          echo "::error::Push impossible après 3 tentatives"
+          exit 1
