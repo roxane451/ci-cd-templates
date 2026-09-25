@@ -1,0 +1,172 @@
+name: Reusable - Update Helm dependency
+
+on:
+  workflow_call:
+    inputs:
+      chart-version:
+        description: "New dependency version"
+        required: true
+        type: string
+
+      chart-path:
+        description: "Path to the consuming Helm chart"
+        required: false
+        default: "helm"
+        type: string
+
+      dependency-name:
+        description: "Helm dependency name"
+        required: false
+        default: "multi-service"
+        type: string
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  update-dependency:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Add Helm repositories
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo add external-secrets https://charts.external-secrets.io
+          helm repo update
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            helm registry login ghcr.io \
+              --username "${{ github.actor }}" \
+              --password-stdin
+
+      - name: Update Chart.yaml dependency version
+        shell: bash
+        env:
+          CHART_PATH: ${{ inputs.chart-path }}
+          DEPENDENCY_NAME: ${{ inputs.dependency-name }}
+          CHART_VERSION: ${{ inputs.chart-version }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          from pathlib import Path
+
+          chart = Path(os.environ["CHART_PATH"]) / "Chart.yaml"
+          dependency = os.environ["DEPENDENCY_NAME"]
+          version = os.environ["CHART_VERSION"]
+
+          if not chart.exists():
+              raise SystemExit(f"Chart.yaml not found: {chart}")
+
+          lines = chart.read_text().splitlines()
+
+          found_dependency = False
+          updated = False
+
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+
+              if stripped == f"- name: {dependency}":
+                  found_dependency = True
+                  continue
+
+              if found_dependency and stripped.startswith("version:"):
+                  indent = line[:len(line) - len(line.lstrip())]
+                  old_version = stripped.split(":", 1)[1].strip().strip('"')
+                  lines[i] = f'{indent}version: "{version}"'
+
+                  print(
+                      f"Updated {dependency}: "
+                      f"{old_version} -> {version}"
+                  )
+
+                  updated = True
+                  break
+
+          if not updated:
+              raise SystemExit(
+                  f"Dependency {dependency!r} not found in {chart}"
+              )
+
+          chart.write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Verify dependency version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Expected version: ${{ inputs.chart-version }}"
+
+          grep -A2 \
+            -- "- name: ${{ inputs.dependency-name }}" \
+            "${{ inputs.chart-path }}/Chart.yaml"
+
+      - name: Update Helm dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in 1 2 3; do
+            echo "Helm dependency update - tentative ${attempt}/3"
+
+            if helm dependency update "${{ inputs.chart-path }}"; then
+              exit 0
+            fi
+
+            if [ "${attempt}" -eq 3 ]; then
+              echo "::error::helm dependency update failed after 3 attempts"
+              exit 1
+            fi
+
+            echo "Nouvelle tentative dans 10 secondes..."
+            sleep 10
+          done
+
+      - name: Helm dependency list
+        run: |
+          helm dependency list "${{ inputs.chart-path }}"
+
+      - name: Helm lint
+        run: |
+          helm lint "${{ inputs.chart-path }}"
+
+      - name: Show changes
+        run: |
+          git diff -- \
+            "${{ inputs.chart-path }}/Chart.yaml" \
+            "${{ inputs.chart-path }}/Chart.lock"
+
+      - name: Commit dependency update
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            "${{ inputs.chart-path }}/Chart.yaml" \
+            "${{ inputs.chart-path }}/Chart.lock" \
+            "${{ inputs.chart-path }}/charts/"
+
+          git commit \
+            -m "chore(helm): update ${{ inputs.dependency-name }} to ${{ inputs.chart-version }}"
+
+          git push

@@ -1,0 +1,45 @@
+name: Reusable — Lint & Test
+
+on:
+  workflow_call:
+
+jobs:
+  lint-test:
+    name: Lint & Tests
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install all dependencies (root workspaces)
+        run: npm ci
+
+      - name: Lint frontend
+        working-directory: ./frontend
+        run: npm run lint
+
+      - name: Lint backend
+        working-directory: ./backend
+        run: npm run lint
+
+      - name: Tests backend
+        working-directory: ./backend
+        run: npm test
+
+      - name: Tests frontend
+        working-directory: ./frontend
+        run: npm test
+
+      - name: npm audit backend
+        run: npm audit --audit-level=high --workspace=backend
+
+      - name: npm audit frontend
+        run: npm audit --audit-level=high --workspace=frontend
+        continue-on-error: true

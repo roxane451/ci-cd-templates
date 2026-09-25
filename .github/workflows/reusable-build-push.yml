@@ -1,0 +1,82 @@
+name: Reusable — Build & Push GHCR
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        required: true
+        type: string
+      context:
+        required: true
+        type: string
+        description: "Sous-dossier du service (ex: ./backend). Le contexte Docker est toujours la racine du monorepo."
+    outputs:
+      image-tag:
+        description: "Tag principal de l'image poussée (sha- sur branche, vX.Y.Z sur tag)"
+        value: ${{ jobs.build-push.outputs.image-tag }}
+
+jobs:
+  build-push:
+    name: Build + Trivy + Push GHCR
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=tag
+
+      # Contexte = racine du monorepo (package.json racine + workspace)
+      # Dockerfile = sous-dossier du service concerné
+      - name: Build image (local, pour Trivy scan)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.context }}/Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/${{ inputs.image-name }}:${{ steps.meta.outputs.version }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+          ignore-unfixed: true
+
+      - name: Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.context }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

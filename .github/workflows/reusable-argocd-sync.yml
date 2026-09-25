@@ -1,0 +1,90 @@
+name: Reusable — ArgoCD Sync (update image tag)
+
+# Ce workflow remplace reusable-helm-deploy.yml dans un contexte ArgoCD.
+# Au lieu de faire un helm upgrade direct sur le cluster, il met à jour
+# le tag de l'image dans ayur-veda-helm → ArgoCD détecte le changement
+# et sync automatiquement.
+#
+# Flux :
+#   CI build image (sha-xxxx)
+#     → ce workflow commit le nouveau tag dans ayur-veda-helm
+#       → ArgoCD poll le repo (interval: 3min) et sync le cluster
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+        description: "preprod | prod"
+      image-tag:
+        required: true
+        type: string
+        description: "Tag de l'image Docker à déployer (ex: sha-05644b3)"
+      values-file:
+        required: true
+        type: string
+        description: "Fichier values à mettre à jour (ex: values-preprod.yaml)"
+    secrets:
+      PAT_HELM_REPO:
+        required: true
+        description: "PAT avec accès write sur ayur-veda-helm"
+
+jobs:
+  update-image-tag:
+    name: Update image tag → ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout ayur-veda-helm
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ayur-veda-helm
+          path: ayur-veda-helm
+          token: ${{ secrets.PAT_HELM_REPO }}
+
+      - name: Update image tags in values file
+        working-directory: ayur-veda-helm
+        run: |
+          VALUES_FILE="helm/${{ inputs.values-file }}"
+
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "Values file not found: $VALUES_FILE"
+            exit 1
+          fi
+
+          echo "Updating image tags in $VALUES_FILE to ${{ inputs.image-tag }}"
+
+          # Met à jour le tag backend
+          sed -i "/repository: ghcr.io\/${{ github.repository_owner }}\/backend/{n;s/tag:.*/tag: ${{ inputs.image-tag }}/}" "$VALUES_FILE"
+
+          # Met à jour le tag frontend
+          sed -i "/repository: ghcr.io\/${{ github.repository_owner }}\/frontend/{n;s/tag:.*/tag: ${{ inputs.image-tag }}/}" "$VALUES_FILE"
+
+          echo "Updated values file:"
+          grep -A2 "repository:" "$VALUES_FILE" | grep -E "repository:|tag:"
+
+      - name: Commit and push
+        working-directory: ayur-veda-helm
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add helm/${{ inputs.values-file }}
+
+          # Ne commit que s'il y a des changements
+          if git diff --staged --quiet; then
+            echo "No changes to commit — image tag already up to date"
+            exit 0
+          fi
+
+          git commit -m "ci(${{ inputs.environment }}): update image tag to ${{ inputs.image-tag }}
+
+          Environment: ${{ inputs.environment }}
+          Image tag: ${{ inputs.image-tag }}
+          Triggered by: ${{ github.repository }}@${{ github.sha }}"
+
+          git push
+          echo " Pushed — ArgoCD will sync ${{ inputs.environment }} automatically"
