@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint (workflows + exemple)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer actionlint
+        run: |
+          set -euo pipefail
+          curl -sSfL https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz \
+            | tar -xz -C /usr/local/bin actionlint
+
+      # actionlint utilise shellcheck (préinstallé sur ubuntu-latest) pour
+      # analyser les scripts des étapes run:
+      - name: Lint des workflows réutilisables
+        run: actionlint -color .github/workflows/*.yml
+
+      - name: Lint des exemples GitHub Actions
+        run: actionlint -color examples/github/*.yml
