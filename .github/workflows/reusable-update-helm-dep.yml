@@ -1,0 +1,107 @@
+name: Reusable — Update Helm dependency
+
+# Met à jour la version d'une dépendance dans le Chart.yaml d'un chart
+# consommateur, régénère Chart.lock, lint le chart et committe.
+# Typiquement déclenché par un repository_dispatch envoyé à la publication
+# d'une nouvelle version du chart dépendance.
+
+on:
+  workflow_call:
+    inputs:
+      dependency-name:
+        description: "Nom de la dépendance dans Chart.yaml"
+        required: true
+        type: string
+      dependency-version:
+        description: "Nouvelle version"
+        required: true
+        type: string
+      chart-path:
+        description: "Dossier du chart consommateur"
+        required: false
+        type: string
+        default: "helm"
+      helm-repos:
+        description: "Dépôts Helm classiques à ajouter, un par ligne : '<nom> <url>' (inutile pour l'OCI)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  update-dependency:
+    name: ${{ inputs.dependency-name }} → ${{ inputs.dependency-version }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer Helm
+        uses: azure/setup-helm@v4
+
+      - name: Dépôts Helm & login GHCR
+        env:
+          HELM_REPOS: ${{ inputs.helm-repos }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          while read -r name url; do
+            [ -n "${name:-}" ] && helm repo add "${name}" "${url}"
+          done <<< "${HELM_REPOS}"
+          [ -n "${HELM_REPOS}" ] && helm repo update
+          echo "${REGISTRY_TOKEN}" | helm registry login ghcr.io --username "${REGISTRY_USER}" --password-stdin
+
+      - name: Mettre à jour Chart.yaml
+        env:
+          CHART: ${{ inputs.chart-path }}/Chart.yaml
+          DEP_NAME: ${{ inputs.dependency-name }}
+          DEP_VERSION: ${{ inputs.dependency-version }}
+        run: |
+          set -euo pipefail
+          [ -f "${CHART}" ] || { echo "::error::${CHART} introuvable"; exit 1; }
+
+          COUNT="$(yq '[.dependencies[] | select(.name == strenv(DEP_NAME))] | length' "${CHART}")"
+          [ "${COUNT}" = "1" ] || { echo "::error::Dépendance ${DEP_NAME} absente ou en double dans ${CHART}"; exit 1; }
+
+          OLD="$(yq '.dependencies[] | select(.name == strenv(DEP_NAME)) | .version' "${CHART}")"
+          yq -i '(.dependencies[] | select(.name == strenv(DEP_NAME)) | .version) = strenv(DEP_VERSION)' "${CHART}"
+          echo "${DEP_NAME} : ${OLD} → ${DEP_VERSION}"
+
+      - name: helm dependency update (3 tentatives)
+        env:
+          CHART_PATH: ${{ inputs.chart-path }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            helm dependency update "${CHART_PATH}" && exit 0
+            echo "Échec (tentative ${attempt}/3), nouvelle tentative dans 10 s..."
+            sleep 10
+          done
+          echo "::error::helm dependency update a échoué 3 fois"
+          exit 1
+
+      - name: helm lint
+        run: helm lint "${{ inputs.chart-path }}"
+
+      - name: Commit & push
+        env:
+          CHART_PATH: ${{ inputs.chart-path }}
+          DEP_NAME: ${{ inputs.dependency-name }}
+          DEP_VERSION: ${{ inputs.dependency-version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Chart.lock suffit à reproduire les dépendances ; charts/*.tgz est
+          # normalement ignoré par Git.
+          git add "${CHART_PATH}/Chart.yaml" "${CHART_PATH}/Chart.lock"
+          if git diff --staged --quiet; then
+            echo "Rien à committer."
+            exit 0
+          fi
+          git commit -m "chore(helm): update ${DEP_NAME} to ${DEP_VERSION}"
+          git push
