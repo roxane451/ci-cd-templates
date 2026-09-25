@@ -1,0 +1,76 @@
+name: Reusable — Lint & tests (Node.js workspaces)
+
+# Lint, tests et audit de dépendances pour un monorepo npm workspaces.
+# Les scripts absents d'un workspace sont ignorés (--if-present).
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Version de Node.js"
+        required: false
+        type: string
+        default: "22"
+      workspaces:
+        description: "Workspaces npm à vérifier, séparés par des espaces"
+        required: false
+        type: string
+        default: "backend frontend"
+      audit-level:
+        description: "Niveau de vulnérabilité npm audit qui fait échouer le job (low|moderate|high|critical)"
+        required: false
+        type: string
+        default: "high"
+
+permissions:
+  contents: read
+
+jobs:
+  lint-test:
+    name: Lint, tests & audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Installer les dépendances (racine du monorepo)
+        run: npm ci
+
+      - name: Lint
+        env:
+          WORKSPACES: ${{ inputs.workspaces }}
+        run: |
+          set -euo pipefail
+          for ws in ${WORKSPACES}; do
+            echo "::group::lint ${ws}"
+            npm run lint --workspace="${ws}" --if-present
+            echo "::endgroup::"
+          done
+
+      - name: Tests
+        env:
+          WORKSPACES: ${{ inputs.workspaces }}
+        run: |
+          set -euo pipefail
+          for ws in ${WORKSPACES}; do
+            echo "::group::test ${ws}"
+            npm test --workspace="${ws}" --if-present
+            echo "::endgroup::"
+          done
+
+      - name: Audit des dépendances
+        env:
+          WORKSPACES: ${{ inputs.workspaces }}
+          AUDIT_LEVEL: ${{ inputs.audit-level }}
+        run: |
+          set -euo pipefail
+          for ws in ${WORKSPACES}; do
+            echo "::group::audit ${ws}"
+            npm audit --omit=dev --audit-level="${AUDIT_LEVEL}" --workspace="${ws}"
+            echo "::endgroup::"
+          done
