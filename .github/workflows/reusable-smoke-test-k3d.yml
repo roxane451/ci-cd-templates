@@ -84,7 +84,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout values
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ inputs.values-repository || github.repository }}
           token: ${{ secrets.repo-token || secrets.GITHUB_TOKEN }}

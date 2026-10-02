@@ -62,7 +62,7 @@ jobs:
       group: helm-deploy-${{ inputs.environment }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Installer Helm
         uses: azure/setup-helm@v4
