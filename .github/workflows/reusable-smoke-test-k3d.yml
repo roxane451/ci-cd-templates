@@ -96,7 +96,7 @@ jobs:
         run: curl -sSfL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG="${K3D_VERSION}" bash
 
       - name: Installer Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
 
       - name: Créer le cluster
         run: k3d cluster create "${CLUSTER}" --wait --timeout 120s
