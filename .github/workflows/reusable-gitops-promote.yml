@@ -52,7 +52,7 @@ jobs:
     environment: ${{ inputs.environment }}
     steps:
       - name: Checkout du dépôt GitOps
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ inputs.gitops-repository }}
           token: ${{ secrets.gitops-token }}
